@@ -2,6 +2,7 @@ import torch
 import os
 import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 from net import (
     TADBaseConfig,
     AVIT_DINO,
@@ -13,8 +14,9 @@ from net import (
 class TADPipelineDINO(TADBaseConfig):
     """TAD Detection Training Pipeline (migrated from original detect_tad.py)"""
     
-    def __init__(self, **kwargs):
+    def __init__(self, resume_training=False, **kwargs):
         super().__init__(**kwargs)
+        self.resume_training = resume_training
         self._setup_pipeline()
     
     def _setup_pipeline(self):
@@ -62,17 +64,50 @@ class TADPipelineDINO(TADBaseConfig):
     def train_model(self, cur_tensor):
         """Train model using DINO-V2 and save best model parameters"""
         print("=== Starting DINO-V2 Self-supervised Training ===")
-        if not self.avit_dino:
-            self.avit_dino = self._create_model()
-            self.avit_dino.init_optimizer()
-        
-        # 获取网络组件
-        networks = self.avit_dino.get_network_for_training()
         
         chr_output_dir = os.path.join(self.output_root, self.chr_name)
         os.makedirs(chr_output_dir, exist_ok=True)
         best_model_path = os.path.join(chr_output_dir, "best_model.pth")
+        
         best_loss = float('inf')
+        
+        if self.resume_training and os.path.exists(best_model_path):
+            print(f"找到现有模型文件，从断点继续训练: {best_model_path}")
+            try:
+                checkpoint = torch.load(best_model_path, map_location=self.device)
+                
+                if not self.avit_dino:
+                    self.avit_dino = self._create_model()
+                    self.avit_dino.init_optimizer()
+                
+                self.avit_dino.student.load_state_dict(checkpoint['student'])
+                self.avit_dino.teacher.load_state_dict(checkpoint['teacher'])
+                
+                if 'student_unet' in checkpoint:
+                    self.avit_dino.student_unet.load_state_dict(checkpoint['student_unet'])
+                if 'teacher_bilstm' in checkpoint:
+                    self.avit_dino.teacher_bilstm.load_state_dict(checkpoint['teacher_bilstm'])
+                if 'mask_token' in checkpoint:
+                    self.avit_dino.mask_token.data.copy_(checkpoint['mask_token'])
+                
+                if 'optimizer' in checkpoint:
+                    self.avit_dino.optimizer.load_state_dict(checkpoint['optimizer'])
+                
+                if 'best_loss' in checkpoint:
+                    best_loss = checkpoint['best_loss']
+                
+                print(f"成功加载模型状态，继续训练，当前最佳损失: {best_loss:.4f}")
+                
+            except Exception as e:
+                print(f"加载模型发生错误: {str(e)}，将从头开始训练")
+                best_loss = float('inf')
+        
+        if not self.avit_dino:
+            self.avit_dino = self._create_model()
+            self.avit_dino.init_optimizer()
+        
+        networks = self.avit_dino.get_network_for_training()
+        
         with tqdm(range(self.num_epochs), desc="Training DINO-V2 Model", 
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}') as pbar:
             for epoch in pbar:
@@ -81,23 +116,25 @@ class TADPipelineDINO(TADBaseConfig):
                     'total_loss': f"{losses['total']:.4f}",
                     'cls_loss': f"{losses['cls']:.4f}",
                     'patch_loss': f"{losses['patch']:.4f}",
-                    'seg_loss': f"{losses.get('segmentation', 0):.4f}"  # 新增：显示分割损失
+                    'seg_loss': f"{losses.get('segmentation', 0):.4f}"
                 })
+                
                 if losses['total'] < best_loss:
                     best_loss = losses['total']
                     save_dict = {
                         'student': self.avit_dino.student.state_dict(),
                         'teacher': self.avit_dino.teacher.state_dict(),
-                        'student_unet': self.avit_dino.student_unet.state_dict(),  # 新增：保存U-NET
-                        'teacher_bilstm': self.avit_dino.teacher_bilstm.state_dict(),  # 新增：保存BiLSTM
+                        'student_unet': self.avit_dino.student_unet.state_dict(),
+                        'teacher_bilstm': self.avit_dino.teacher_bilstm.state_dict(),
                         'mask_token': self.avit_dino.mask_token,
-                        'model_params': self.get_model_params()
+                        'model_params': self.get_model_params(),
+                        'optimizer': self.avit_dino.optimizer.state_dict(),
+                        'best_loss': best_loss
                     }
                     torch.save(save_dict, best_model_path)
+                
                 if epoch % 5 == 0:
                     torch.cuda.empty_cache()
-                    
-                    # 新增：每5个epoch可视化边界预测结果
                     self._visualize_boundary_predictions(cur_tensor, epoch, chr_output_dir)
                 
         print(f"DINO-V2 training completed, best loss: {best_loss:.4f}")
@@ -110,17 +147,13 @@ class TADPipelineDINO(TADBaseConfig):
     def _visualize_boundary_predictions(self, matrix, epoch, output_dir):
         """Visualize boundary prediction results"""
         try:
-            # 获取边界预测
             boundary_preds = self.avit_dino.get_boundary_predictions(matrix)
             segmentation = boundary_preds.get('segmentation')
             edge_scores = boundary_preds.get('edge_scores')
             
             if segmentation is not None:
-                # 转换为numpy
                 seg_np = segmentation.cpu().numpy()[0, 0]
                 
-                # 保存可视化结果
-                import matplotlib.pyplot as plt
                 fig, ax = plt.subplots(figsize=(10, 10))
                 im = ax.imshow(seg_np, cmap='viridis')
                 plt.colorbar(im)
@@ -130,10 +163,8 @@ class TADPipelineDINO(TADBaseConfig):
                 plt.close()
                 
             if edge_scores is not None:
-                # 转换为numpy
                 edge_np = edge_scores.cpu().numpy()[0]
                 
-                # 绘制边缘分数
                 plt.figure(figsize=(12, 5))
                 plt.plot(edge_np)
                 plt.title(f"Epoch {epoch}: Edge Scores")
@@ -159,8 +190,7 @@ class TADPipelineDINO(TADBaseConfig):
         self.train_model(cur_tensor)
 
 def main():
-    # 示例训练流程
-    pipeline = TADPipelineDINO()
+    pipeline = TADPipelineDINO(resume_training=True)
     pipeline.run()
     print("Model training and parameter saving process completed")
 
