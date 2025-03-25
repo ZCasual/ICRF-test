@@ -1,0 +1,168 @@
+import torch
+import os
+import numpy as np
+from tqdm import tqdm
+from net import (
+    TADBaseConfig,
+    AVIT_DINO,
+    LowRank,
+    find_chromosome_files,
+    fill_hic
+)
+
+class TADPipelineDINO(TADBaseConfig):
+    """TAD Detection Training Pipeline (migrated from original detect_tad.py)"""
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._setup_pipeline()
+    
+    def _setup_pipeline(self):
+        """Initialize components and checkpoint configurations"""
+        self.adj_graph = None
+        self.normalized_matrix = None
+        self.avit_dino = None
+        torch.backends.cuda.checkpoint_activations = False
+        torch.backends.cuda.checkpoint_layers_n = 10
+
+    def load_data(self):
+        """Data loading process: Load Hi-C data and return contact matrix"""
+        hic_paths = find_chromosome_files(self.output_root)
+        if not hic_paths:
+            raise FileNotFoundError("Hi-C data files not found")
+        hic_path = hic_paths[0]
+        chr_dir = os.path.dirname(hic_path)
+        self.chr_name = os.path.basename(chr_dir)
+        print(f"[DEBUG] Current chromosome: {self.chr_name}")
+        matrix = fill_hic(hic_path, self.resolution)
+        print(f"[DEBUG] matrix_sum = {np.sum(matrix)}")
+        return matrix
+
+    def _create_model(self, patch_size=None):
+        """Create DINO-V2 model based on A-VIT backbone network"""
+        model_params = self.get_model_params()
+        if patch_size is not None:
+            model_params['patch_size'] = patch_size
+        model = AVIT_DINO(
+            embed_dim=model_params['embed_dim'], 
+            patch_size=model_params['patch_size'], 
+            num_layers=model_params['num_layers'], 
+            num_heads=model_params['num_heads'],
+            use_amp=model_params['use_amp'],
+            ema_decay=model_params['ema_decay'],
+            mask_ratio=model_params['mask_ratio'],
+            gamma_base=model_params['gamma_base'],
+            epsilon_base=model_params['epsilon_base'],
+            use_theory_gamma=model_params['use_theory_gamma'],
+            boundary_weight=model_params['boundary_weight']
+        ).to(self.device)
+        print(f"Creating DINO-V2 model with A-VIT backbone, parameters: {model_params}")
+        return model
+
+    def train_model(self, cur_tensor):
+        """Train model using DINO-V2 and save best model parameters"""
+        print("=== Starting DINO-V2 Self-supervised Training ===")
+        if not self.avit_dino:
+            self.avit_dino = self._create_model()
+            self.avit_dino.init_optimizer()
+        
+        # 获取网络组件
+        networks = self.avit_dino.get_network_for_training()
+        
+        chr_output_dir = os.path.join(self.output_root, self.chr_name)
+        os.makedirs(chr_output_dir, exist_ok=True)
+        best_model_path = os.path.join(chr_output_dir, "best_model.pth")
+        best_loss = float('inf')
+        with tqdm(range(self.num_epochs), desc="Training DINO-V2 Model", 
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}') as pbar:
+            for epoch in pbar:
+                losses = self.avit_dino.train_epoch(cur_tensor)
+                pbar.set_postfix({
+                    'total_loss': f"{losses['total']:.4f}",
+                    'cls_loss': f"{losses['cls']:.4f}",
+                    'patch_loss': f"{losses['patch']:.4f}",
+                    'seg_loss': f"{losses.get('segmentation', 0):.4f}"  # 新增：显示分割损失
+                })
+                if losses['total'] < best_loss:
+                    best_loss = losses['total']
+                    save_dict = {
+                        'student': self.avit_dino.student.state_dict(),
+                        'teacher': self.avit_dino.teacher.state_dict(),
+                        'student_unet': self.avit_dino.student_unet.state_dict(),  # 新增：保存U-NET
+                        'teacher_bilstm': self.avit_dino.teacher_bilstm.state_dict(),  # 新增：保存BiLSTM
+                        'mask_token': self.avit_dino.mask_token,
+                        'model_params': self.get_model_params()
+                    }
+                    torch.save(save_dict, best_model_path)
+                if epoch % 5 == 0:
+                    torch.cuda.empty_cache()
+                    
+                    # 新增：每5个epoch可视化边界预测结果
+                    self._visualize_boundary_predictions(cur_tensor, epoch, chr_output_dir)
+                
+        print(f"DINO-V2 training completed, best loss: {best_loss:.4f}")
+        del self.avit_dino.optimizer
+        if hasattr(self.avit_dino, 'scaler'):
+            del self.avit_dino.scaler
+        torch.cuda.empty_cache()
+        print("Training resources released")
+
+    def _visualize_boundary_predictions(self, matrix, epoch, output_dir):
+        """Visualize boundary prediction results"""
+        try:
+            # 获取边界预测
+            boundary_preds = self.avit_dino.get_boundary_predictions(matrix)
+            segmentation = boundary_preds.get('segmentation')
+            edge_scores = boundary_preds.get('edge_scores')
+            
+            if segmentation is not None:
+                # 转换为numpy
+                seg_np = segmentation.cpu().numpy()[0, 0]
+                
+                # 保存可视化结果
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(10, 10))
+                im = ax.imshow(seg_np, cmap='viridis')
+                plt.colorbar(im)
+                plt.title(f"Epoch {epoch}: Segmentation Prediction")
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"seg_pred_epoch{epoch}.png"))
+                plt.close()
+                
+            if edge_scores is not None:
+                # 转换为numpy
+                edge_np = edge_scores.cpu().numpy()[0]
+                
+                # 绘制边缘分数
+                plt.figure(figsize=(12, 5))
+                plt.plot(edge_np)
+                plt.title(f"Epoch {epoch}: Edge Scores")
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"edge_scores_epoch{epoch}.png"))
+                plt.close()
+        except Exception as e:
+            print(f"Error visualizing boundary predictions: {str(e)}")
+
+    def run(self):
+        """Main process execution: Data loading -> CUR decomposition -> Model training and parameter saving"""
+        matrix = self.load_data()
+        projector = LowRank(p=0.7, alpha=0.7)
+        cur_matrix = projector.fit_transform(matrix)
+        print(f"[DEBUG] CUR matrix shape: {cur_matrix.shape}, sparsity: {np.mean(cur_matrix < 1e-6):.2%}")
+        del matrix
+        
+        print(f"[DEBUG] CUR matrix shape: {cur_matrix.shape}, sparsity: {np.mean(cur_matrix < 1e-6):.2%}")
+        
+        cur_tensor = torch.from_numpy(cur_matrix).float().to(self.device)
+        del cur_matrix
+        
+        self.train_model(cur_tensor)
+
+def main():
+    # 示例训练流程
+    pipeline = TADPipelineDINO()
+    pipeline.run()
+    print("Model training and parameter saving process completed")
+
+if __name__ == "__main__":
+    main()
