@@ -108,19 +108,30 @@ class TADPipelineDINO(TADBaseConfig):
         
         networks = self.avit_dino.get_network_for_training()
         
-        with tqdm(range(self.num_epochs), desc="Training DINO-V2 Model", 
+        # 获取梯度累积步骤数
+        grad_accum_steps = getattr(self.avit_dino.student, 'grad_accum_steps', 4)
+        
+        with tqdm(range(self.num_epochs), desc="训练 DINO-V2 模型", 
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}') as pbar:
             for epoch in pbar:
-                losses = self.avit_dino.train_epoch(cur_tensor)
-                pbar.set_postfix({
-                    'total_loss': f"{losses['total']:.4f}",
-                    'cls_loss': f"{losses['cls']:.4f}",
-                    'patch_loss': f"{losses['patch']:.4f}",
-                    'seg_loss': f"{losses.get('segmentation', 0):.4f}"
-                })
+                # 改用返回迭代器的train_epoch方法
+                for step, step_losses in enumerate(self.avit_dino.train_epoch_with_progress(cur_tensor)):
+                    # 每步更新tqdm的postfix显示当前损失
+                    pbar.set_postfix({
+                        'epoch': f"{epoch+1}/{self.num_epochs}",
+                        'step': f"{step+1}/{grad_accum_steps}",
+                        'loss': f"{step_losses['total']:.4f}",
+                        'cls': f"{step_losses['cls']:.4f}",
+                        'patch': f"{step_losses['patch']:.4f}"
+                    })
+                    # 强制刷新进度条
+                    pbar.refresh()
                 
-                if losses['total'] < best_loss:
-                    best_loss = losses['total']
+                # 获取整个epoch的累积损失
+                epoch_losses = self.avit_dino.get_epoch_losses()
+                
+                if epoch_losses['total'] < best_loss:
+                    best_loss = epoch_losses['total']
                     save_dict = {
                         'student': self.avit_dino.student.state_dict(),
                         'teacher': self.avit_dino.teacher.state_dict(),
@@ -137,7 +148,7 @@ class TADPipelineDINO(TADBaseConfig):
                     torch.cuda.empty_cache()
                     self._visualize_boundary_predictions(cur_tensor, epoch, chr_output_dir)
                 
-        print(f"DINO-V2 training completed, best loss: {best_loss:.4f}")
+        print(f"DINO-V2 训练完成，最佳损失: {best_loss:.4f}")
         del self.avit_dino.optimizer
         if hasattr(self.avit_dino, 'scaler'):
             del self.avit_dino.scaler

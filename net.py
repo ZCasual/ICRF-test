@@ -8,7 +8,7 @@ from collections import defaultdict
 import math
 
 # 导入模块
-from tad_modules import (LowRank, GeometricFeatureExtractor, AVIT, 
+from tad_modules import (LowRank, AVIT, 
                         EdgeAwareBiLSTM, SimplifiedUNet, 
                         find_chromosome_files, fill_hic)  # 从模块导入函数
 
@@ -557,15 +557,19 @@ class AVIT_DINO(nn.Module):
             'segmentation': seg_loss  # 新增：分割损失
         }
 
-    def train_epoch(self, matrix):
+    def train_epoch_with_progress(self, matrix):
+        """训练一个epoch并返回每步的损失（用于实时进度显示）"""
         self.student.train()
         self.teacher.eval()  # 教师模型始终处于评估模式
         
-        # 训练步骤
-        total_loss = 0.0
-        cls_loss = 0.0
-        patch_loss = 0.0
-        encoding_rate = 0.0
+        # 重置累积损失
+        self._epoch_losses = {
+            'total': 0.0,
+            'cls': 0.0,
+            'patch': 0.0,
+            'encoding_rate': 0.0,
+            'segmentation': 0.0
+        }
         
         # 分批次处理以减少内存使用
         grad_accum_steps = getattr(self.student, 'grad_accum_steps', 4)
@@ -597,10 +601,12 @@ class AVIT_DINO(nn.Module):
                 scaled_loss.backward()
             
             # 收集损失
-            total_loss += losses['total'].item()
-            cls_loss += losses['cls'].item()
-            patch_loss += losses['patch'].item()
-            encoding_rate += losses['encoding_rate'].item()
+            for k, v in losses.items():
+                if k in self._epoch_losses:
+                    self._epoch_losses[k] += v.item()
+            
+            # 创建当前步骤的损失副本（避免引用问题）
+            current_losses = {k: v.item() for k, v in losses.items()}
             
             # 释放内存
             del outputs, losses, scaled_loss
@@ -617,17 +623,25 @@ class AVIT_DINO(nn.Module):
                 
                 # 更新教师网络
                 self._update_teacher()
+            
+            # 返回当前步骤的损失
+            yield current_losses
         
         # 清理缓存
         torch.cuda.empty_cache()
-        
-        avg_steps = grad_accum_steps or 1
-        return {
-            'total': total_loss / avg_steps,
-            'cls': cls_loss / avg_steps,
-            'patch': patch_loss / avg_steps,
-            'encoding_rate': encoding_rate / avg_steps
-        }
+
+    def get_epoch_losses(self):
+        """返回整个epoch的累积损失"""
+        avg_steps = getattr(self.student, 'grad_accum_steps', 4) or 1
+        return {k: v / avg_steps for k, v in self._epoch_losses.items()}
+
+    def train_epoch(self, matrix):
+        """原有的训练epoch方法（为保持兼容性）"""
+        # 通过新方法遍历所有步骤
+        for _ in self.train_epoch_with_progress(matrix):
+            pass
+        # 返回累积损失
+        return self.get_epoch_losses()
 
     def init_optimizer(self):
         """初始化优化器"""

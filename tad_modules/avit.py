@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from .geometric import GeometricFeatureExtractor
+import numpy as np
 
 class AVIT(nn.Module):
     """视觉Transformer骨干网络"""
@@ -48,10 +47,7 @@ class AVIT(nn.Module):
         # 新增：控制是否使用混合精度
         self.use_amp = use_amp
 
-        # +++ 几何特征提取器 - 始终启用 +++
-        self.geometric_extractor = GeometricFeatureExtractor(feature_dim=embed_dim)
-        
-        # 几何特征增强层
+        # 几何特征增强层 - 保留但不使用
         self.geometric_enhancement = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.LayerNorm(embed_dim // 2),
@@ -59,8 +55,8 @@ class AVIT(nn.Module):
             nn.Linear(embed_dim // 2, 1)
         )
         
-        # 几何特征融合参数
-        self.geo_lambda = nn.Parameter(torch.tensor(0.5))
+        # 几何特征融合参数 - 保留但设置为0
+        self.geo_lambda = nn.Parameter(torch.tensor(0.0))
         
         # 边界权重生成器 - 用于loss计算
         self.boundary_weight_generator = nn.Sequential(
@@ -152,19 +148,10 @@ class AVIT(nn.Module):
             # 初始化参数
             self._reset_parameters()
             
-            # 新增：几何特征融合层
-            self.geo_fusion_short = nn.LayerNorm(d_model)
-            self.geo_fusion_mid = nn.LayerNorm(d_model)
-            self.geo_fusion_long = nn.LayerNorm(d_model)
+            # 移除几何特征融合相关参数
             
-            # 新增：几何特征融合权重参数
-            self.geo_weight_short = nn.Parameter(torch.tensor(0.2))
-            self.geo_weight_mid = nn.Parameter(torch.tensor(0.2))
-            self.geo_weight_long = nn.Parameter(torch.tensor(0.2))
-            
-            # 新增：几何引导注意力参数
-            self.use_geometric_attention = True
-            self.geo_attn_lambda = nn.Parameter(torch.tensor(0.2))
+            # 移除：几何引导注意力参数
+            self.use_geometric_attention = False
         
         def _reset_parameters(self):
             """初始化参数"""
@@ -179,7 +166,7 @@ class AVIT(nn.Module):
                 src: 输入特征 [B, L, D]
                 src_mask: 注意力掩码
                 src_key_padding_mask: 键值掩码
-                geo_feedback: 几何特征回传列表 [short, mid, long]
+                geo_feedback: 几何特征回传列表 [short, mid, long] - 现在忽略此参数
             """
             x = src
             
@@ -189,24 +176,7 @@ class AVIT(nn.Module):
                 layer.gamma_param = lambda layer_i=layer_idx: torch.ones(1, device=x.device)
                 layer.beta_param = lambda layer_i=layer_idx: torch.zeros(1, device=x.device)
                 
-                # 如果是第二层且有几何回传，进行融合
-                if i == 1 and geo_feedback is not None and len(geo_feedback) > 0:
-                    # 处理几何特征 - 需要从[B,D,H,W]转为[B,L,D]
-                    geo_short = geo_feedback[0]
-                    B, D, H, W = geo_short.shape
-                    geo_flat = geo_short.permute(0, 2, 3, 1).reshape(B, H*W, D)
-                    
-                    # 确保尺寸匹配（如果序列长度不同，进行调整）
-                    if geo_flat.shape[1] != x.shape[1]:
-                        # 插值调整到相同序列长度
-                        geo_flat = F.interpolate(
-                            geo_flat.transpose(1, 2), 
-                            size=x.shape[1], 
-                            mode='linear'
-                        ).transpose(1, 2)
-                    
-                    # 融合几何特征
-                    x = self.geo_fusion_short(x + self.geo_weight_short * geo_flat)
+                # 移除几何特征融合代码
                 
                 # 前向传播
                 x = layer(x, src_mask=src_mask, src_key_padding_mask=src_key_padding_mask)
@@ -225,23 +195,7 @@ class AVIT(nn.Module):
                 layer.gamma_param = lambda layer_i=layer_idx: torch.ones(1, device=x.device)
                 layer.beta_param = lambda layer_i=layer_idx: torch.zeros(1, device=x.device)
                 
-                # 如果是第二层且有几何回传，进行融合
-                if i == 1 and geo_feedback is not None and len(geo_feedback) > 1:
-                    # 处理几何特征 - 需要从[B,D,H,W]转为[B,L,D]
-                    geo_mid = geo_feedback[1]
-                    B, D, H, W = geo_mid.shape
-                    geo_flat = geo_mid.permute(0, 2, 3, 1).reshape(B, H*W, D)
-                    
-                    # 确保尺寸匹配
-                    if geo_flat.shape[1] != x.shape[1]:
-                        geo_flat = F.interpolate(
-                            geo_flat.transpose(1, 2), 
-                            size=x.shape[1], 
-                            mode='linear'
-                        ).transpose(1, 2)
-                    
-                    # 融合几何特征
-                    x = self.geo_fusion_mid(x + self.geo_weight_mid * geo_flat)
+                # 移除几何特征融合代码
                 
                 # 前向传播
                 x = layer(x, src_mask=src_mask, src_key_padding_mask=src_key_padding_mask)
@@ -264,23 +218,7 @@ class AVIT(nn.Module):
                 layer.gamma_param = lambda layer_i=layer_idx: torch.ones(1, device=x.device)
                 layer.beta_param = lambda layer_i=layer_idx: torch.zeros(1, device=x.device)
                 
-                # 如果是第二层且有几何回传，进行融合
-                if i == 1 and geo_feedback is not None and len(geo_feedback) > 2:
-                    # 处理几何特征 - 需要从[B,D,H,W]转为[B,L,D]
-                    geo_long = geo_feedback[2]
-                    B, D, H, W = geo_long.shape
-                    geo_flat = geo_long.permute(0, 2, 3, 1).reshape(B, H*W, D)
-                    
-                    # 确保尺寸匹配
-                    if geo_flat.shape[1] != x.shape[1]:
-                        geo_flat = F.interpolate(
-                            geo_flat.transpose(1, 2), 
-                            size=x.shape[1], 
-                            mode='linear'
-                        ).transpose(1, 2)
-                    
-                    # 融合几何特征
-                    x = self.geo_fusion_long(x + self.geo_weight_long * geo_flat)
+                # 移除几何特征融合代码
                 
                 # 前向传播
                 x = layer(x, src_mask=src_mask, src_key_padding_mask=src_key_padding_mask)
@@ -391,7 +329,7 @@ class AVIT(nn.Module):
             return x_proj.view(x_proj.size(1), -1).permute(1, 0)
 
     class EarlyStoppingEncoderLayer(nn.TransformerEncoderLayer):
-        """带早停机制的自定义编码层（新增几何引导注意力）"""
+        """带早停机制的自定义编码层（移除几何引导注意力）"""
         def __init__(self, tau, *args, **kwargs):
             # 提取tau参数后调用父类初始化
             self.tau = kwargs.pop('tau', tau)
@@ -400,8 +338,8 @@ class AVIT(nn.Module):
             # 初始化掩码存储
             self.register_buffer('cumul_states', None)
             
-            # 新增几何引导注意力支持
-            self.supports_geo_attention = True
+            # 移除几何引导注意力支持
+            self.supports_geo_attention = False
         
         def forward(self, src, src_mask=None, src_key_padding_mask=None, geo_attention_bias=None, **kwargs):
             # 首层初始化累计停止状态
@@ -428,13 +366,7 @@ class AVIT(nn.Module):
             else:
                 src_key_padding_mask |= ~active_mask.squeeze(-1)
             
-            # 修改注意力计算，添加几何引导
-            if geo_attention_bias is not None and self.supports_geo_attention:
-                # 如果提供了几何注意力偏置，添加到注意力计算中
-                if src_mask is None:
-                    src_mask = geo_attention_bias
-                else:
-                    src_mask = src_mask + geo_attention_bias
+            # 移除几何引导注意力代码
             
             # 传递所有参数到父类方法（包括可能的is_causal参数）
             return super().forward(src, src_mask=src_mask, 
@@ -457,21 +389,16 @@ class AVIT(nn.Module):
         # 直接获取多尺度卷积嵌入的跳跃连接特征
         skip_features = self.conv_embed.skip_features if hasattr(self.conv_embed, 'skip_features') else None
         
-        # 在编码前设置几何特征提取器的跳跃连接
-        if skip_features is not None:
-            self.geometric_extractor.set_skip_features(skip_features)
+        # 移除在编码前设置几何特征提取器的代码
         
         # 调整维度顺序 [batch_size, seq_len, features]
         x = x.unsqueeze(0)
         
-        # 生成几何引导注意力偏置
+        # 移除几何引导注意力偏置代码
         geo_attention_bias = None
-        if hasattr(self.geometric_extractor, 'get_attention_bias'):
-            geo_attention_bias = self.geometric_extractor.get_attention_bias(
-                (1, x.shape[1], x.shape[2]), x.device)
         
-        # 执行前向传播 (Transformer编码器) - 传递几何特征偏置
-        encoder_output = self.multiscale_transformer(x, src_mask=geo_attention_bias)
+        # 执行前向传播 (Transformer编码器) - 不再传递几何特征偏置
+        encoder_output = self.multiscale_transformer(x)
         
         # 使用缓存而不是存储在类属性中，避免计算图泄漏
         self._encoder_output_cache = encoder_output.detach().clone()
@@ -484,22 +411,9 @@ class AVIT(nn.Module):
         side_len = int(np.sqrt(reconstructed.numel() // batch_size))
         reconstructed_2d = reconstructed.view(batch_size, side_len, side_len)
         
-        # 几何特征处理 - 使用已设置的跳跃连接特征
-        # 将重建结果重塑为2D特征图
-        recon_feature_map = reconstructed_2d.unsqueeze(1)  # [B, 1, H, W]
-        
-        # 获取几何特征和几何反馈
-        geometric_features, geo_feedback = self.geometric_extractor(recon_feature_map)
-        
-        # 转回序列形式
-        geo_attention = geometric_features.view(batch_size, -1)  # [B, H*W]
-        
-        # 保存几何特征用于损失计算
-        self._geo_attention_cache = geo_attention.detach().clone()
-        
-        # 应用几何特征调制重建结果
-        reconstructed_enhanced = reconstructed_2d * (1 + self.geo_lambda * geometric_features.squeeze(1))
-        reconstructed = reconstructed_enhanced.squeeze(0)  # 返回增强后的重建结果
+        # 移除几何特征处理代码
+        # 保留重建结果的2D形状
+        reconstructed = reconstructed_2d.squeeze(0)
     
         # 计算边界权重（用于loss）
         self._boundary_weights = self.boundary_weight_generator(encoder_output).squeeze(-1)
@@ -508,18 +422,13 @@ class AVIT(nn.Module):
         z_mean = encoder_output.mean(dim=1)
         z_logvar = torch.zeros_like(z_mean)
         
-        # 新增：生成几何引导注意力偏置
-        geo_attention_bias = self.geometric_extractor.get_attention_bias(
-            encoder_output.shape, encoder_output.device)
-        
-        # 使用几何引导注意力偏置增强重建过程
-        # ... 现有代码 ...
+        # 移除几何引导注意力偏置代码
         
         return reconstructed, z_mean, z_logvar
 
     def _compute_losses(self, matrix: torch.Tensor, recon: torch.Tensor, 
                        z_mean: torch.Tensor, z_logvar: torch.Tensor) -> dict:
-        """计算所有损失项，加入几何特征引导"""
+        """计算所有损失项，移除几何特征引导"""
         
         # 获取重建损失
         recon_loss = F.mse_loss(recon, matrix)
