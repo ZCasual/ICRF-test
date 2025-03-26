@@ -160,42 +160,44 @@ class TADPredictor:
             outputs = self.model(matrix_tensor)
             
             # 获取边界预测结果
-            if isinstance(outputs, dict) and 'teacher_edge_scores' in outputs:
-                edge_scores = outputs['teacher_edge_scores']
+            if isinstance(outputs, dict) and 'teacher_boundary_probs' in outputs:
+                boundary_probs = outputs['teacher_boundary_probs']
             elif hasattr(self.model, 'get_boundary_predictions'):
                 # 使用边界预测专用方法
                 boundary_preds = self.model.get_boundary_predictions(matrix_tensor)
-                edge_scores = boundary_preds.get('edge_scores', None)
+                boundary_probs = boundary_preds.get('boundary_probs')
             else:
                 logger.error("模型输出中没有边界预测结果")
                 return [], chr_name
         
-        # 处理边缘评分，将张量转换为numpy数组
-        if edge_scores is not None:
-            if torch.is_tensor(edge_scores):
-                edge_scores = edge_scores.cpu().numpy()
+        # 处理边界概率，将张量转换为numpy数组
+        if boundary_probs is not None:
+            if torch.is_tensor(boundary_probs):
+                boundary_probs = boundary_probs.cpu().numpy()
             
-            # 根据边缘评分提取TAD边界
-            if len(edge_scores.shape) > 1 and edge_scores.shape[0] == 1:
-                edge_scores = edge_scores[0]  # 移除批次维度
+            # 根据边界概率提取TAD边界
+            if len(boundary_probs.shape) > 1 and boundary_probs.shape[0] == 1:
+                boundary_probs = boundary_probs[0]  # 移除批次维度
             
             # 截取到原始大小
-            if edge_scores.shape[0] > orig_size:
-                edge_scores = edge_scores[:orig_size]
+            if boundary_probs.shape[0] > orig_size:
+                boundary_probs = boundary_probs[:orig_size]
             
             # 识别TAD
             tads = []
-            # 寻找边缘评分的峰值作为TAD边界
+            # 寻找边界概率的峰值作为TAD边界
             peaks = []
-            threshold = np.mean(edge_scores) + 0.5 * np.std(edge_scores)
+            
+            # 使用固定阈值而非统计阈值
+            threshold = self.score_threshold  # 默认是0.5
             
             # 找出所有峰值
-            for i in range(2, len(edge_scores)-2):
-                if (edge_scores[i] > edge_scores[i-1] and 
-                    edge_scores[i] > edge_scores[i-2] and
-                    edge_scores[i] > edge_scores[i+1] and
-                    edge_scores[i] > edge_scores[i+2] and
-                    edge_scores[i] > threshold):
+            for i in range(2, len(boundary_probs)-2):
+                if (boundary_probs[i] > boundary_probs[i-1] and 
+                    boundary_probs[i] > boundary_probs[i-2] and
+                    boundary_probs[i] > boundary_probs[i+1] and
+                    boundary_probs[i] > boundary_probs[i+2] and
+                    boundary_probs[i] > threshold):
                     peaks.append(i)
             
             # 添加起始点和终止点
@@ -211,14 +213,17 @@ class TADPredictor:
                 end_bp = int(end * self.resolution)
                 
                 # 确保TAD大小大于阈值 - 添加最小大小检查(30000bp)
-                if end - start >= 5 and (end_bp - start_bp) >= 100000:  # 至少5个bin且大于30000bp
-                    tads.append((start_bp, end_bp))
+                if end - start >= self.min_tad_size and (end_bp - start_bp) >= 100000:  # 至少5个bin且大于30000bp
+                    # 计算区域内平均边界概率作为TAD质量评分
+                    region_score = float(np.mean(boundary_probs[start:end]))
+                    tads.append((start_bp, end_bp, region_score))
             
             # 创建BED格式条目
             bed_entries = self._create_bed_entries(tads)
+            logger.info(f"找到 {len(tads)} 个潜在TAD边界")
             return bed_entries, chr_name
         else:
-            logger.error("无法从模型获取边缘评分")
+            logger.error("无法从模型获取边界概率")
             return [], chr_name
 
     def _create_bed_entries(self, tads):
@@ -226,9 +231,14 @@ class TADPredictor:
         bed_entries = []
         chr_name = self._get_chr_name()
         
-        for i, (start_bp, end_bp) in enumerate(tads):
-            # 计算简单TAD分数
-            score = 1000  # BED格式常用分数范围
+        for i, tad_info in enumerate(tads):
+            if len(tad_info) == 2:
+                start_bp, end_bp = tad_info
+                score = 1000  # 默认分数
+            else:
+                start_bp, end_bp, region_score = tad_info
+                # 将区域评分转换为合适的BED分数(0-1000)
+                score = min(1000, int(region_score * 1000))
             
             # 创建BED条目
             bed_entries.append(f"{chr_name}\t{start_bp}\t{end_bp}\tTAD_{i}\t{score}")

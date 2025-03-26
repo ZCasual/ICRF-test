@@ -145,11 +145,15 @@ class TADPipelineDINO(TADBaseConfig):
         print("Training resources released")
 
     def _visualize_boundary_predictions(self, matrix, epoch, output_dir):
-        """Visualize boundary prediction results"""
+        """可视化边界预测结果"""
         try:
+            # 设置全局字体支持中文
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
+            plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+            
             boundary_preds = self.avit_dino.get_boundary_predictions(matrix)
             segmentation = boundary_preds.get('segmentation')
-            edge_scores = boundary_preds.get('edge_scores')
+            boundary_probs = boundary_preds.get('boundary_probs')
             
             if segmentation is not None:
                 seg_np = segmentation.cpu().numpy()[0, 0]
@@ -157,19 +161,24 @@ class TADPipelineDINO(TADBaseConfig):
                 fig, ax = plt.subplots(figsize=(10, 10))
                 im = ax.imshow(seg_np, cmap='viridis')
                 plt.colorbar(im)
+                # 使用英文替代中文避免字体问题
                 plt.title(f"Epoch {epoch}: Segmentation Prediction")
                 plt.tight_layout()
                 plt.savefig(os.path.join(output_dir, f"seg_pred_epoch{epoch}.png"))
                 plt.close()
                 
-            if edge_scores is not None:
-                edge_np = edge_scores.cpu().numpy()[0]
+            if boundary_probs is not None:
+                boundary_np = boundary_probs.cpu().numpy()[0]
                 
                 plt.figure(figsize=(12, 5))
-                plt.plot(edge_np)
-                plt.title(f"Epoch {epoch}: Edge Scores")
+                plt.plot(boundary_np)
+                # 使用英文替代中文避免字体问题
+                plt.title(f"Epoch {epoch}: Boundary Probabilities")
+                plt.ylabel("Probability")
+                plt.xlabel("Position")
+                plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.5)
                 plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f"edge_scores_epoch{epoch}.png"))
+                plt.savefig(os.path.join(output_dir, f"boundary_probs_epoch{epoch}.png"))
                 plt.close()
         except Exception as e:
             print(f"Error visualizing boundary predictions: {str(e)}")

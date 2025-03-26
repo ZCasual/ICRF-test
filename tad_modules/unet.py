@@ -96,6 +96,11 @@ class SimplifiedUNet(nn.Module):
         final_out = self.final(dec1)
         
         # 增强边界的分割结果
-        enhanced_out = final_out * (1 + 0.5 * edge_map)
+        enhanced_out = final_out * 0.7 + edge_map * 0.3
+        enhanced_out = torch.clamp(enhanced_out, 0.0, 1.0)
+        
+        # 确保输出类型与输入一致（支持混合精度训练）
+        if enhanced_out.dtype != x.dtype:
+            enhanced_out = enhanced_out.to(x.dtype)
         
         return enhanced_out

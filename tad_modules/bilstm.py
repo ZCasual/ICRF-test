@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 class EdgeAwareBiLSTM(nn.Module):
-    """BiLSTM边缘判别器，专门分析TAD边界特征"""
+    """BiLSTM边界判别器，输出TAD边界概率"""
     def __init__(self, input_dim=64, hidden_dim=32):
         super().__init__()
         self.input_dim = input_dim
@@ -22,17 +22,17 @@ class EdgeAwareBiLSTM(nn.Module):
             batch_first=True
         )
         
-        # 边缘评分网络 - 评估边界质量
-        self.edge_scorer = nn.Sequential(
+        # 边界概率判别器 - 输出边界概率
+        self.boundary_classifier = nn.Sequential(
             nn.Linear(hidden_dim*2, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Sigmoid()  # 使用Sigmoid确保输出为概率值
         )
     
     def forward(self, features, regions=None, hic_matrix=None):
         """
-        分析边缘特征，返回边界评分和边界建议
+        分析特征并输出边界概率
         
         Args:
             features: 特征张量 [B, C, H, W] 或 [B, L, D]
@@ -40,8 +40,8 @@ class EdgeAwareBiLSTM(nn.Module):
             hic_matrix: 可选的Hi-C矩阵
             
         Returns:
-            edge_scores: 边缘评分
-            boundary_adj: 边界调整建议
+            boundary_probs: 边界概率 [B, L]
+            boundary_adj: 边界调整建议 [B, L]
         """
         # 处理特征形状
         if features.dim() == 4:  # [B, C, H, W]
@@ -56,25 +56,36 @@ class EdgeAwareBiLSTM(nn.Module):
         # 通过BiLSTM处理序列
         lstm_out, _ = self.bilstm(features_proj)  # [B, L, hidden_dim*2]
         
-        # 计算所有位置的边缘评分
+        # 计算所有位置的边界概率
         batch_size, seq_len, _ = lstm_out.shape
-        edge_scores = torch.zeros(batch_size, seq_len, device=features.device)
+        boundary_probs = torch.zeros(batch_size, seq_len, device=features.device)
         
         for i in range(seq_len):
-            edge_scores[:, i] = self.edge_scorer(lstm_out[:, i]).squeeze(-1)
+            boundary_probs[:, i] = self.boundary_classifier(lstm_out[:, i]).squeeze(-1)
         
-        # 为边界加强评分信号
-        edge_scores[:, 0] = edge_scores[:, 0] * 1.2  # 增强左边界
-        edge_scores[:, -1] = edge_scores[:, -1] * 1.2  # 增强右边界
+        # 为序列起始和结束位置增强边界概率信号
+        boundary_probs[:, 0] = boundary_probs[:, 0] * 1.2  # 增强左边界
+        boundary_probs[:, -1] = boundary_probs[:, -1] * 1.2  # 增强右边界
         
-        # 生成边界调整建议 (简单的梯度估计)
-        boundary_adj = torch.zeros_like(edge_scores)
+        # 约束概率范围在[0,1]之间，同时确保精度正确
+        boundary_probs = torch.clamp(boundary_probs, 0.0, 1.0)
+        
+        # 生成边界调整建议 (基于概率梯度)
+        boundary_adj = torch.zeros_like(boundary_probs)
         for b in range(batch_size):
             for i in range(1, seq_len-1):
-                # 如果当前位置评分低于邻居，建议向邻居方向调整
-                if edge_scores[b, i] < edge_scores[b, i-1]:
+                # 根据概率梯度确定调整方向
+                left_grad = boundary_probs[b, i] - boundary_probs[b, i-1]
+                right_grad = boundary_probs[b, i] - boundary_probs[b, i+1]
+                
+                if left_grad < 0 and abs(left_grad) > abs(right_grad):
                     boundary_adj[b, i] = -1  # 向左调整
-                elif edge_scores[b, i] < edge_scores[b, i+1]:
-                    boundary_adj[b, i] = 1  # 向右调整
+                elif right_grad < 0 and abs(right_grad) > abs(left_grad):
+                    boundary_adj[b, i] = 1   # 向右调整
         
-        return edge_scores, boundary_adj
+        # 返回前确保张量类型与输入一致（支持混合精度训练）
+        if features.dtype != boundary_probs.dtype:
+            boundary_probs = boundary_probs.to(features.dtype)
+            boundary_adj = boundary_adj.to(features.dtype)
+        
+        return boundary_probs, boundary_adj

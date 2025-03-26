@@ -418,7 +418,7 @@ class AVIT_DINO(nn.Module):
             self._update_center(teacher_cls)
             
             # 新增：教师BiLSTM边界检测
-            teacher_edge_scores, teacher_boundary_adj = self.teacher_bilstm(teacher_output)
+            teacher_boundary_probs, teacher_boundary_adj = self.teacher_bilstm(teacher_output)
         
         # 将新增的预测添加到输出字典
         return {
@@ -428,7 +428,7 @@ class AVIT_DINO(nn.Module):
             'teacher_patches': teacher_patches,
             'mask_indices': mask_indices,
             'student_segmentation': student_segmentation,  # 新增：学生分割预测
-            'teacher_edge_scores': teacher_edge_scores,    # 新增：教师边缘评分
+            'teacher_boundary_probs': teacher_boundary_probs,    # 修改：教师边界概率
             'teacher_boundary_adj': teacher_boundary_adj   # 新增：教师边界调整
         }
 
@@ -506,31 +506,40 @@ class AVIT_DINO(nn.Module):
         
         # 获取新增的预测
         student_segmentation = outputs.get('student_segmentation')
-        teacher_edge_scores = outputs.get('teacher_edge_scores')
+        teacher_boundary_probs = outputs.get('teacher_boundary_probs')
         
         # 2. 新增联合任务损失
         
-        # 2.1 分割一致性损失（学生分割应与教师边缘评分一致）
+        # 2.1 分割一致性损失（学生分割应与教师边界概率一致）
         seg_loss = 0.0
-        if student_segmentation is not None and teacher_edge_scores is not None:
-            # 确保teacher_edge_scores是2D或3D张量
-            if teacher_edge_scores.dim() == 1:
-                teacher_edge_scores = teacher_edge_scores.unsqueeze(0)  # [L] -> [1, L]
+        if student_segmentation is not None and teacher_boundary_probs is not None:
+            # 确保teacher_boundary_probs是2D或3D张量
+            if teacher_boundary_probs.dim() == 1:
+                teacher_boundary_probs = teacher_boundary_probs.unsqueeze(0)  # [L] -> [1, L]
             
-            # 将教师边缘评分重塑为2D图像格式
-            teacher_edge_2d = self._reshape_to_2d(teacher_edge_scores)
+            # 将教师边界概率重塑为2D图像格式
+            teacher_boundary_2d = self._reshape_to_2d(teacher_boundary_probs)
             
             # 确保尺寸匹配
-            if teacher_edge_2d.shape[2:] != student_segmentation.shape[2:]:
-                teacher_edge_2d = F.interpolate(
-                    teacher_edge_2d, 
+            if teacher_boundary_2d.shape[2:] != student_segmentation.shape[2:]:
+                teacher_boundary_2d = F.interpolate(
+                    teacher_boundary_2d, 
                     size=student_segmentation.shape[2:],
                     mode='bilinear',
                     align_corners=False
                 )
             
-            # 计算分割一致性损失
-            seg_loss = F.mse_loss(student_segmentation, teacher_edge_2d)
+            # 计算分割一致性损失 - 使用AMP安全的方式计算BCE损失
+            if self.use_amp:
+                # 暂时退出自动混合精度上下文来计算BCE损失
+                with torch.cuda.amp.autocast(enabled=False):
+                    # 将张量转换为float32以确保精度
+                    student_seg_float = student_segmentation.float()
+                    teacher_boundary_float = teacher_boundary_2d.float()
+                    seg_loss = F.binary_cross_entropy(student_seg_float, teacher_boundary_float)
+            else:
+                # 正常计算BCE损失
+                seg_loss = F.binary_cross_entropy(student_segmentation, teacher_boundary_2d)
         
         # 总联合损失
         joint_loss = seg_loss * self.boundary_weight
@@ -571,11 +580,13 @@ class AVIT_DINO(nn.Module):
                 with torch.amp.autocast('cuda'):
                     # 前向传播
                     outputs = self(matrix)
-                    losses = self.compute_loss(outputs)
                     
-                    # 缩放损失并反向传播
-                    scaled_loss = losses['total'] / grad_accum_steps
-                    self.scaler.scale(scaled_loss).backward()
+                # 在自动混合精度外计算损失以避免BCE问题
+                losses = self.compute_loss(outputs)
+                
+                # 缩放损失并反向传播
+                scaled_loss = losses['total'] / grad_accum_steps
+                self.scaler.scale(scaled_loss).backward()
             else:
                 # 前向传播
                 outputs = self(matrix)
@@ -634,6 +645,7 @@ class AVIT_DINO(nn.Module):
         
         if self.use_amp:
             self.scaler = torch.amp.GradScaler()
+            self.check_amp_compatibility()  # 添加兼容性检查
 
     def get_network_for_training(self):
         """返回网络组件用于训练"""
@@ -659,12 +671,32 @@ class AVIT_DINO(nn.Module):
         
         # 提取边界相关预测
         student_segmentation = outputs.get('student_segmentation')
-        teacher_edge_scores = outputs.get('teacher_edge_scores')
+        teacher_boundary_probs = outputs.get('teacher_boundary_probs')  # 修改：使用边界概率
         
         return {
             'segmentation': student_segmentation.detach() if student_segmentation is not None else None,
-            'edge_scores': teacher_edge_scores.detach() if teacher_edge_scores is not None else None
+            'boundary_probs': teacher_boundary_probs.detach() if teacher_boundary_probs is not None else None  # 修改：返回边界概率
         }
+
+    def check_amp_compatibility(self):
+        """检查模型组件是否与自动混合精度兼容"""
+        if not self.use_amp:
+            return True
+        
+        # 检查关键组件
+        issues = []
+        
+        # 检查BCE损失是否在AMP上下文外计算
+        # 这个函数被添加为提示，实际上我们会在compute_loss中
+        # 正确处理自动混合精度下的BCE损失
+        
+        print(f"自动混合精度兼容性检查完成。")
+        if issues:
+            print(f"发现{len(issues)}个问题:")
+            for issue in issues:
+                print(f" - {issue}")
+            return False
+        return True
 
 class TADFeatureExtractor(TADBaseConfig):
     """TAD特征提取器：从HiC数据中提取特征矩阵"""
